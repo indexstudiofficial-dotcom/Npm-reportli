@@ -1,0 +1,35 @@
+{
+  "name": "reportli",
+  "version": "1.0.0",
+  "description": "Enterprise-grade real-time exception tracking and AI-powered diagnostic SDK for client-side, server-side, and full-stack SaaS applications.",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "import": "./dist/index.mjs",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "node build.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "error-tracking",
+    "bug-tracking",
+    "exception-monitoring",
+    "nextjs",
+    "express",
+    "supabase",
+    "gemini",
+    "diagnostics"
+  ],
+  "author": "Reportli Team <reportliaihq@gmail.com>",
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.20.2",
+    "typescript": "^5.3.3"
+  }
+}

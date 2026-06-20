@@ -1,6 +1,6 @@
 {
   "name": "reportli",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Enterprise-grade real-time exception tracking and AI-powered diagnostic SDK for client-side, server-side, and full-stack SaaS applications.",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

@@ -1,15 +1,17 @@
-// src/index.ts — Reportli SDK v1.0.6
-// Sends all errors to Cloudflare Worker
-
-// ─── Config ───────────────────────────────────────────────────────────────────
+// src/index.ts — Reportli SDK v1.0.8
+// Sends errors immediately or in queue, but stores user activity in-session and sends it once on exit.
 
 const WORKER_URL = "https://old-paper-f025.reportliaihq.workers.dev";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
 
 type Config = {
   apiKey: string;
   environment?: string;
+};
+
+type UserIdentity = {
+  email?: string;
+  name?: string;
+  userId?: string;
 };
 
 type ErrorPayload = {
@@ -28,17 +30,46 @@ type ErrorPayload = {
   severity: "low" | "medium" | "high" | "critical";
   status: string;
   context: string;
+  user_email?: string;
+  user_name?: string;
+  user_id?: string;
+  session_id?: string;
 };
 
-// ─── State ────────────────────────────────────────────────────────────────────
+type ActivityEvent = {
+  event: string;
+  timestamp: string;
+  url: string;
+  properties?: Record<string, unknown>;
+};
+
+type SessionEndPayload = {
+  type: "SESSION_END";
+  session_id: string;
+  user_email: string;
+  user_name?: string;
+  user_id?: string;
+  started_at: string;
+  ended_at: string;
+  duration_seconds: number;
+  page_views: number;
+  environment: string;
+  browser: string;
+  events: ActivityEvent[];
+};
 
 let initialized = false;
 let _config: Config;
+let _user: UserIdentity = {};
+let _sessionId = "";
+let _sessionStartedAt = "";
+let _pageViews = 0;
+let _sessionEvents: ActivityEvent[] = [];
+let _hasFlushedSession = false;
+
 const queue: ErrorPayload[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let isFlushing = false;
-
-// ─── Environment ──────────────────────────────────────────────────────────────
 
 const _isBrowser = (() => {
   try { return typeof window !== "undefined" && typeof document !== "undefined"; }
@@ -50,7 +81,21 @@ const _isNode = (() => {
   catch { return false; }
 })();
 
-// ─── Send to Worker ───────────────────────────────────────────────────────────
+function generateId(): string {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function startSession(): void {
+  _sessionId = generateId();
+  _sessionStartedAt = new Date().toISOString();
+  _pageViews = 0;
+  _sessionEvents = [];
+  _hasFlushedSession = false;
+}
+
+function getUserEmail(): string {
+  return _user.email || "anonymous";
+}
 
 async function sendToWorker(payload: object, attempts = 3): Promise<void> {
   for (let i = 0; i < attempts; i++) {
@@ -65,9 +110,7 @@ async function sendToWorker(payload: object, attempts = 3): Promise<void> {
         keepalive: true,
       });
       if (res.ok) return;
-    } catch {
-      // wait before retry
-    }
+    } catch {}
     await sleep(1000 * (i + 1));
   }
 }
@@ -80,9 +123,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ─── Queue & Batch ────────────────────────────────────────────────────────────
-
-function enqueue(payload: ErrorPayload): void {
+function enqueueError(payload: ErrorPayload): void {
   if (!initialized) return;
   if (queue.length >= 100) return;
   queue.push(payload);
@@ -93,11 +134,11 @@ function scheduleFlush(): void {
   if (flushTimer) return;
   flushTimer = setTimeout(() => {
     flushTimer = null;
-    flush();
+    flushErrors();
   }, 2000);
 }
 
-async function flush(): Promise<void> {
+async function flushErrors(): Promise<void> {
   if (isFlushing || queue.length === 0) return;
   isFlushing = true;
   const batch = queue.splice(0, 10);
@@ -105,16 +146,14 @@ async function flush(): Promise<void> {
     await sendToWorker(payload);
   }
   isFlushing = false;
-  if (queue.length > 0) flush();
+  if (queue.length > 0) flushErrors();
 }
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getUrl(): string {
   try {
     if (_isBrowser) return window.location.href;
     if (_isNode) return require("os").hostname();
-  } catch { /* silent */ }
+  } catch {}
   return "unknown";
 }
 
@@ -122,7 +161,7 @@ function getBrowser(): string {
   try {
     if (_isBrowser && navigator?.userAgent) return navigator.userAgent;
     if (_isNode) return `Node.js ${process.version}`;
-  } catch { /* silent */ }
+  } catch {}
   return "unknown";
 }
 
@@ -133,9 +172,7 @@ function getEnvironment(): string {
 function parseStack(stack: string | undefined): { file: string; line: number; column: number } {
   try {
     if (!stack) return { file: "unknown", line: 0, column: 0 };
-    const match =
-      stack.match(/at .+ \((.+):(\d+):(\d+)\)/) ||
-      stack.match(/at (.+):(\d+):(\d+)/);
+    const match = stack.match(/at .+ ((.+):(d+):(d+))/) || stack.match(/at (.+):(d+):(d+)/);
     return {
       file: match?.[1]?.split("/")?.pop() || "unknown",
       line: parseInt(match?.[2] || "0"),
@@ -159,52 +196,29 @@ function classifyError(error: any, context?: string): { category: string; severi
     const msg = String(error?.message || error || "").toLowerCase();
     const name = String(error?.name || "").toLowerCase();
 
-    if (msg.includes("stripe") || msg.includes("payment") || msg.includes("card declined") || msg.includes("checkout") || msg.includes("refund"))
-      return { category: "Payment Error", severity: "critical" };
-    if (msg.includes("jwt") || msg.includes("token expired") || msg.includes("unauthorized") || msg.includes("session") || msg.includes("oauth") || msg.includes("login failed"))
-      return { category: "Auth Error", severity: "high" };
-    if (msg.includes("supabase") || msg.includes("database") || msg.includes("connection lost") || msg.includes("transaction") || msg.includes("duplicate key"))
-      return { category: "Database Error", severity: "critical" };
-    if (msg.includes("hydration") || msg.includes("does not match server"))
-      return { category: "Hydration Error", severity: "high" };
-    if (msg.includes("invalid hook") || msg.includes("rules of hooks"))
-      return { category: "Hook Error", severity: "critical" };
-    if (msg.includes("render") || msg.includes("error boundary"))
-      return { category: "Render Error", severity: "critical" };
-    if (msg.includes("dynamic import") || msg.includes("failed to fetch dynamically"))
-      return { category: "Import Error", severity: "high" };
-    if (msg.includes("cors") || msg.includes("cross-origin"))
-      return { category: "CORS Error", severity: "high" };
-    if (msg.includes("fetch failed") || msg.includes("failed to fetch") || name === "fetcherror")
-      return { category: "Network Error", severity: "high" };
-    if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("etimedout"))
-      return { category: "Timeout Error", severity: "medium" };
-    if (msg.includes("websocket"))
-      return { category: "WebSocket Error", severity: "high" };
-    if (msg.includes("http 401") || msg.includes("xhr 401"))
-      return { category: "Auth Error", severity: "high" };
-    if (msg.includes("http 403") || msg.includes("xhr 403"))
-      return { category: "Auth Error", severity: "high" };
-    if (msg.includes("http 404") || msg.includes("xhr 404"))
-      return { category: "Not Found Error", severity: "medium" };
-    if (msg.includes("http 500") || msg.includes("xhr 500"))
-      return { category: "Server Error", severity: "critical" };
-    if (msg.includes("http 503") || msg.includes("xhr 503"))
-      return { category: "Server Error", severity: "critical" };
-    if (msg.includes("maximum call stack") || msg.includes("out of memory") || msg.includes("heap limit"))
-      return { category: "Memory Error", severity: "critical" };
-    if (msg.includes("cannot find module") || msg.includes("module not found"))
-      return { category: "Module Error", severity: "critical" };
-    if (msg.includes("econnrefused") || msg.includes("connection refused"))
-      return { category: "Connection Error", severity: "critical" };
-    if (msg.includes("email") || msg.includes("smtp") || msg.includes("sendgrid"))
-      return { category: "Email Error", severity: "high" };
-    if (msg.includes("cron") || msg.includes("webhook") || msg.includes("queue"))
-      return { category: "Job Error", severity: "high" };
-    if (msg.includes("upload") || msg.includes("file size") || msg.includes("invalid file"))
-      return { category: "File Error", severity: "medium" };
-    if (msg.includes("quota exceeded") || msg.includes("localstorage") || msg.includes("indexeddb"))
-      return { category: "Storage Error", severity: "medium" };
+    if (msg.includes("stripe") || msg.includes("payment") || msg.includes("card declined") || msg.includes("checkout") || msg.includes("refund")) return { category: "Payment Error", severity: "critical" };
+    if (msg.includes("jwt") || msg.includes("token expired") || msg.includes("unauthorized") || msg.includes("session") || msg.includes("oauth") || msg.includes("login failed")) return { category: "Auth Error", severity: "high" };
+    if (msg.includes("supabase") || msg.includes("database") || msg.includes("connection lost") || msg.includes("transaction") || msg.includes("duplicate key")) return { category: "Database Error", severity: "critical" };
+    if (msg.includes("hydration") || msg.includes("does not match server")) return { category: "Hydration Error", severity: "high" };
+    if (msg.includes("invalid hook") || msg.includes("rules of hooks")) return { category: "Hook Error", severity: "critical" };
+    if (msg.includes("render") || msg.includes("error boundary")) return { category: "Render Error", severity: "critical" };
+    if (msg.includes("dynamic import") || msg.includes("failed to fetch dynamically")) return { category: "Import Error", severity: "high" };
+    if (msg.includes("cors") || msg.includes("cross-origin")) return { category: "CORS Error", severity: "high" };
+    if (msg.includes("fetch failed") || msg.includes("failed to fetch") || name === "fetcherror") return { category: "Network Error", severity: "high" };
+    if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("etimedout")) return { category: "Timeout Error", severity: "medium" };
+    if (msg.includes("websocket")) return { category: "WebSocket Error", severity: "high" };
+    if (msg.includes("http 401") || msg.includes("xhr 401")) return { category: "Auth Error", severity: "high" };
+    if (msg.includes("http 403") || msg.includes("xhr 403")) return { category: "Auth Error", severity: "high" };
+    if (msg.includes("http 404") || msg.includes("xhr 404")) return { category: "Not Found Error", severity: "medium" };
+    if (msg.includes("http 500") || msg.includes("xhr 500")) return { category: "Server Error", severity: "critical" };
+    if (msg.includes("http 503") || msg.includes("xhr 503")) return { category: "Server Error", severity: "critical" };
+    if (msg.includes("maximum call stack") || msg.includes("out of memory") || msg.includes("heap limit")) return { category: "Memory Error", severity: "critical" };
+    if (msg.includes("cannot find module") || msg.includes("module not found")) return { category: "Module Error", severity: "critical" };
+    if (msg.includes("econnrefused") || msg.includes("connection refused")) return { category: "Connection Error", severity: "critical" };
+    if (msg.includes("email") || msg.includes("smtp") || msg.includes("sendgrid")) return { category: "Email Error", severity: "high" };
+    if (msg.includes("cron") || msg.includes("webhook") || msg.includes("queue")) return { category: "Job Error", severity: "high" };
+    if (msg.includes("upload") || msg.includes("file size") || msg.includes("invalid file")) return { category: "File Error", severity: "medium" };
+    if (msg.includes("quota exceeded") || msg.includes("localstorage") || msg.includes("indexeddb")) return { category: "Storage Error", severity: "medium" };
     if (name === "typeerror") return { category: "TypeError", severity: "high" };
     if (name === "referenceerror") return { category: "ReferenceError", severity: "critical" };
     if (name === "rangeerror") return { category: "RangeError", severity: "high" };
@@ -212,8 +226,7 @@ function classifyError(error: any, context?: string): { category: string; severi
     if (context === "unhandledrejection") return { category: "Promise Error", severity: "medium" };
     if (context === "express") return { category: "Server Error", severity: "high" };
     if (context === "resource") return { category: "Resource Error", severity: "low" };
-  } catch { /* silent */ }
-
+  } catch {}
   return { category: "Unknown Error", severity: "medium" };
 }
 
@@ -240,6 +253,10 @@ function buildPayload(error: any, context?: string): ErrorPayload {
       severity,
       status: "open",
       context: context || "auto",
+      user_email: getUserEmail(),
+      user_name: _user.name || undefined,
+      user_id: _user.userId || undefined,
+      session_id: _sessionId,
     };
   } catch {
     return {
@@ -258,11 +275,59 @@ function buildPayload(error: any, context?: string): ErrorPayload {
       severity: "medium",
       status: "open",
       context: "auto",
+      user_email: getUserEmail(),
+      session_id: _sessionId,
     };
   }
 }
 
-// ─── Patch fetch safely ───────────────────────────────────────────────────────
+function buildActivityEvent(event: string, properties?: Record<string, unknown>): ActivityEvent {
+  return {
+    event,
+    timestamp: new Date().toISOString(),
+    url: getUrl(),
+    properties: properties || {},
+  };
+}
+
+function recordActivity(event: string, properties?: Record<string, unknown>): void {
+  if (!initialized) return;
+  if (!event) return;
+  _sessionEvents.push(buildActivityEvent(event, properties));
+}
+
+function sendSessionEnd(): void {
+  try {
+    if (!_sessionId || _hasFlushedSession) return;
+    _hasFlushedSession = true;
+
+    const endedAt = new Date().toISOString();
+    const startMs = new Date(_sessionStartedAt).getTime();
+    const endMs = new Date(endedAt).getTime();
+    const durationSeconds = Math.max(0, Math.round((endMs - startMs) / 1000));
+
+    const sessionPayload: SessionEndPayload = {
+      type: "SESSION_END",
+      session_id: _sessionId,
+      user_email: getUserEmail(),
+      user_name: _user.name || undefined,
+      user_id: _user.userId || undefined,
+      started_at: _sessionStartedAt,
+      ended_at: endedAt,
+      duration_seconds: durationSeconds,
+      page_views: _pageViews,
+      environment: getEnvironment(),
+      browser: getBrowser(),
+      events: _sessionEvents,
+    };
+
+    if (_isBrowser && navigator.sendBeacon) {
+      navigator.sendBeacon(WORKER_URL, JSON.stringify(sessionPayload));
+    } else {
+      sendImmediate(sessionPayload);
+    }
+  } catch {}
+}
 
 function patchFetch(): void {
   try {
@@ -272,15 +337,10 @@ function patchFetch(): void {
     const patchedFetch = async function (...args: Parameters<typeof fetch>): Promise<Response> {
       const url = (() => {
         try {
-          return typeof args[0] === "string"
-            ? args[0]
-            : args[0] instanceof URL
-            ? args[0].toString()
-            : (args[0] as Request)?.url ?? "";
+          return typeof args[0] === "string" ? args[0] : args[0] instanceof URL ? args[0].toString() : (args[0] as Request)?.url ?? "";
         } catch { return ""; }
       })();
 
-      // Never intercept Worker requests
       if (url.includes("old-paper-f025.reportliaihq.workers.dev")) {
         return originalFetch(...args);
       }
@@ -288,7 +348,7 @@ function patchFetch(): void {
       try {
         const response = await originalFetch(...args);
         if (!response.ok) {
-          enqueue(buildPayload({
+          enqueueError(buildPayload({
             name: `HTTP_${response.status}`,
             message: `HTTP ${response.status}: ${(args[1] as RequestInit)?.method || "GET"} ${url}`,
             stack: `${(args[1] as RequestInit)?.method || "GET"} ${url} → ${response.status} ${response.statusText}`,
@@ -297,7 +357,7 @@ function patchFetch(): void {
         }
         return response;
       } catch (err: any) {
-        enqueue(buildPayload({
+        enqueueError(buildPayload({
           name: "FetchError",
           message: `Fetch failed: ${url} — ${err?.message}`,
           stack: err?.stack,
@@ -315,20 +375,36 @@ function patchFetch(): void {
         configurable: true,
       });
     }
-  } catch { /* silent */ }
+  } catch {}
 }
 
-// ─── Browser Listeners ────────────────────────────────────────────────────────
+function trackPageViews(): void {
+  try {
+    _pageViews++;
+    recordActivity("page_view", { path: window.location.pathname });
+
+    const originalPushState = history.pushState;
+    history.pushState = function (...args) {
+      originalPushState.apply(history, args);
+      _pageViews++;
+      recordActivity("page_view", { path: window.location.pathname });
+    };
+
+    window.addEventListener("popstate", () => {
+      _pageViews++;
+      recordActivity("page_view", { path: window.location.pathname });
+    });
+  } catch {}
+}
 
 function activateBrowserListeners(): void {
-  // JS errors + resource errors
   try {
     window.addEventListener("error", (event) => {
       try {
         const target = event.target as HTMLElement;
         if (target?.tagName && ["IMG", "SCRIPT", "LINK", "VIDEO", "AUDIO"].includes(target.tagName)) {
           const src = (target as any).src || (target as any).href || "unknown";
-          enqueue(buildPayload({ name: "ResourceError", message: `${target.tagName} failed to load: ${src}`, stack: "" }, "resource"));
+          enqueueError(buildPayload({ name: "ResourceError", message: `${target.tagName} failed to load: ${src}`, stack: "" }, "resource"));
           return;
         }
         const err = (event as ErrorEvent).error || {
@@ -336,27 +412,24 @@ function activateBrowserListeners(): void {
           message: (event as ErrorEvent).message || "Unknown error",
           stack: `at ${(event as ErrorEvent).filename}:${(event as ErrorEvent).lineno}:${(event as ErrorEvent).colno}`,
         };
-        enqueue(buildPayload(err, "window"));
-      } catch { /* silent */ }
+        enqueueError(buildPayload(err, "window"));
+      } catch {}
     }, true);
-  } catch { /* silent */ }
+  } catch {}
 
-  // Promise rejections
   try {
     window.addEventListener("unhandledrejection", (event) => {
       try {
         const err = event.reason instanceof Error
           ? event.reason
           : { name: "UnhandledRejection", message: String(event.reason || "Unhandled Promise Rejection"), stack: "" };
-        enqueue(buildPayload(err, "unhandledrejection"));
-      } catch { /* silent */ }
+        enqueueError(buildPayload(err, "unhandledrejection"));
+      } catch {}
     });
-  } catch { /* silent */ }
+  } catch {}
 
-  // Fetch interception
   patchFetch();
 
-  // XHR interception
   try {
     const OrigOpen = XMLHttpRequest.prototype.open;
     const OrigSend = XMLHttpRequest.prototype.send;
@@ -365,7 +438,7 @@ function activateBrowserListeners(): void {
       try {
         (this as any)._r_method = method;
         (this as any)._r_url = url;
-      } catch { /* silent */ }
+      } catch {}
       return OrigOpen.call(this, method, url, ...rest);
     } as any;
 
@@ -377,61 +450,61 @@ function activateBrowserListeners(): void {
           this.addEventListener("loadend", () => {
             try {
               if (this.status >= 400 || this.status === 0) {
-                enqueue(buildPayload({
+                enqueueError(buildPayload({
                   name: `XHR_${this.status}`,
                   message: `XHR ${this.status}: ${method} ${url}`,
                   stack: `${method} ${url} → ${this.status} ${this.statusText}`,
                   status: this.status,
                 }, "xhr"));
               }
-            } catch { /* silent */ }
+            } catch {}
           });
         }
-      } catch { /* silent */ }
+      } catch {}
       return OrigSend.apply(this, args);
     } as any;
-  } catch { /* silent */ }
+  } catch {}
 
-  // Disconnect on page close
+  trackPageViews();
+
   try {
     window.addEventListener("beforeunload", () => {
-      try {
-        navigator.sendBeacon(
-          WORKER_URL,
-          JSON.stringify({
-            type: "SDK_DISCONNECTED",
-            timestamp: new Date().toISOString(),
-            environment: getEnvironment(),
-            url: getUrl(),
-          })
-        );
-      } catch { /* silent */ }
+      try { sendSessionEnd(); } catch {}
     });
-  } catch { /* silent */ }
-}
+  } catch {}
 
-// ─── Server Listeners ─────────────────────────────────────────────────────────
+  try {
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        recordActivity("tab_hidden");
+      } else {
+        recordActivity("tab_visible");
+      }
+    });
+  } catch {}
+}
 
 function activateServerListeners(): void {
   try {
     process.on("uncaughtException", (error: Error) => {
-      try { enqueue(buildPayload(error, "uncaughtException")); flush(); } catch { /* silent */ }
+      try { enqueueError(buildPayload(error, "uncaughtException")); flushErrors(); } catch {}
     });
-  } catch { /* silent */ }
+  } catch {}
 
   try {
     process.on("unhandledRejection", (reason: any) => {
       try {
-        enqueue(buildPayload(
+        enqueueError(buildPayload(
           reason instanceof Error ? reason : { name: "UnhandledRejection", message: String(reason), stack: "" },
           "unhandledrejection"
         ));
-      } catch { /* silent */ }
+      } catch {}
     });
-  } catch { /* silent */ }
+  } catch {}
 
   const shutdown = async (signal: string) => {
     try {
+      sendSessionEnd();
       await sendToWorker({
         type: "SDK_DISCONNECTED",
         timestamp: new Date().toISOString(),
@@ -439,15 +512,13 @@ function activateServerListeners(): void {
         url: getUrl(),
         signal,
       });
-    } catch { /* silent */ }
+    } catch {}
     process.exit(0);
   };
 
-  try { process.on("SIGTERM", () => shutdown("SIGTERM")); } catch { /* silent */ }
-  try { process.on("SIGINT", () => shutdown("SIGINT")); } catch { /* silent */ }
+  try { process.on("SIGTERM", () => shutdown("SIGTERM")); } catch {}
+  try { process.on("SIGINT", () => shutdown("SIGINT")); } catch {}
 }
-
-// ─── Public API ───────────────────────────────────────────────────────────────
 
 export const Reportli = {
   init(cfg: Config): void {
@@ -457,22 +528,49 @@ export const Reportli = {
 
       _config = cfg;
       initialized = true;
+      startSession();
 
-      // Send connected ping immediately
       sendImmediate({
         type: "SDK_INITIALIZED",
         timestamp: new Date().toISOString(),
         environment: getEnvironment(),
         url: getUrl(),
         browser: getBrowser(),
+        session_id: _sessionId,
       });
 
-      if (_isBrowser) {
-        activateBrowserListeners();
-      } else if (_isNode) {
-        activateServerListeners();
-      }
-    } catch { /* never crash user app */ }
+      if (_isBrowser) activateBrowserListeners();
+      else if (_isNode) activateServerListeners();
+    } catch {}
+  },
+
+  identify(user: UserIdentity): void {
+    try {
+      if (!initialized) return;
+      _user = {
+        email: user.email || undefined,
+        name: user.name || undefined,
+        userId: user.userId || undefined,
+      };
+
+      sendImmediate({
+        type: "IDENTIFY",
+        user_email: getUserEmail(),
+        user_name: _user.name || undefined,
+        user_id: _user.userId || undefined,
+        session_id: _sessionId,
+        timestamp: new Date().toISOString(),
+        environment: getEnvironment(),
+      });
+    } catch {}
+  },
+
+  track(event: string, properties?: Record<string, unknown>): void {
+    try {
+      if (!initialized) return;
+      if (!event) return;
+      recordActivity(event, properties);
+    } catch {}
   },
 
   capture(error: unknown): void {
@@ -481,22 +579,26 @@ export const Reportli = {
       const err = error instanceof Error
         ? error
         : { name: "ManualCapture", message: String(error), stack: new Error().stack };
-      enqueue(buildPayload(err, "manual"));
-    } catch { /* silent */ }
+      enqueueError(buildPayload(err, "manual"));
+    } catch {}
   },
 
   captureMessage(message: string): void {
     try {
       if (!initialized) return;
-      enqueue(buildPayload({ name: "Message", message, stack: "" }, "manual"));
-    } catch { /* silent */ }
+      enqueueError(buildPayload({ name: "Message", message, stack: "" }, "manual"));
+    } catch {}
   },
 
   errorHandler() {
     return function (err: any, _req: any, _res: any, next: any) {
-      try { enqueue(buildPayload(err, "express")); } catch { /* silent */ }
+      try { enqueueError(buildPayload(err, "express")); } catch {}
       next(err);
     };
+  },
+
+  flushSession(): void {
+    sendSessionEnd();
   },
 };
 

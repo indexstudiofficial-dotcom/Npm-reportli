@@ -71,15 +71,17 @@ const queue: ErrorPayload[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let isFlushing = false;
 
-const _isBrowser = (() => {
+function isBrowser(): boolean {
   try { return typeof window !== "undefined" && typeof document !== "undefined"; }
   catch { return false; }
-})();
+}
 
-const _isNode = (() => {
-  try { return typeof process !== "undefined" && !!process.versions?.node && !_isBrowser; }
+function isNode(): boolean {
+  try { return typeof process !== "undefined" && !!process.versions?.node && !isBrowser(); }
   catch { return false; }
-})();
+}
+
+
 
 function generateId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -151,28 +153,28 @@ async function flushErrors(): Promise<void> {
 
 function getUrl(): string {
   try {
-    if (_isBrowser) return window.location.href;
-    if (_isNode) return require("os").hostname();
+    if (isBrowser()) return window.location.href;
+    if (isNode()) return require("os").hostname();
   } catch {}
   return "unknown";
 }
 
 function getBrowser(): string {
   try {
-    if (_isBrowser && navigator?.userAgent) return navigator.userAgent;
-    if (_isNode) return `Node.js ${process.version}`;
+    if (isBrowser() && navigator?.userAgent) return navigator.userAgent;
+    if (isNode()) return `Node.js ${process.version}`;
   } catch {}
   return "unknown";
 }
 
 function getEnvironment(): string {
-  return _config?.environment ?? (_isBrowser ? "browser" : "server");
+  return _config?.environment ?? (isBrowser() ? "browser" : "server");
 }
 
 function parseStack(stack: string | undefined): { file: string; line: number; column: number } {
   try {
     if (!stack) return { file: "unknown", line: 0, column: 0 };
-    const match = stack.match(/at .+ ((.+):(d+):(d+))/) || stack.match(/at (.+):(d+):(d+)/);
+    const match = stack.match(/at .+ \((.+):(\d+):(\d+)\)/) || stack.match(/at (.+):(\d+):(\d+)/);
     return {
       file: match?.[1]?.split("/")?.pop() || "unknown",
       line: parseInt(match?.[2] || "0"),
@@ -321,7 +323,7 @@ function sendSessionEnd(): void {
       events: _sessionEvents,
     };
 
-    if (_isBrowser && navigator.sendBeacon) {
+    if (isBrowser() && navigator.sendBeacon) {
       navigator.sendBeacon(WORKER_URL, JSON.stringify(sessionPayload));
     } else {
       sendImmediate(sessionPayload);
@@ -539,8 +541,8 @@ export const Reportli = {
         session_id: _sessionId,
       });
 
-      if (_isBrowser) activateBrowserListeners();
-      else if (_isNode) activateServerListeners();
+      if (isBrowser()) activateBrowserListeners();
+      else if (isNode()) activateServerListeners();
     } catch {}
   },
 

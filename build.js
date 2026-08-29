@@ -15,12 +15,11 @@ async function build() {
     entryPoints: ["src/index.ts"],
     outfile: "dist/index.js",
     bundle: true,
-    platform: "node",
+    platform: "neutral",
     format: "cjs",
     target: "es2020",
     sourcemap: true,
     minify: false,
-    external: ["esbuild"],
   });
 
   console.log("📦 Compiling ES Module bundle...");
